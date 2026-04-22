@@ -1,0 +1,23 @@
+{
+  "skill_name": "connect-mcp-tools",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I need to add a Lambda function to my Amazon Connect AI agent so it can check order status when customers call. My Connect instance is in us-east-1 and I already have the Lambda ready.",
+      "expected_output": "Creates Flow Module with Lambda, publishes it, attaches as MCP tool to agent, adds security permissions",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "I have an existing ORCHESTRATION agent in Connect and want to add a new tool that calls my payment processing Lambda. Can you help me attach it?",
+      "expected_output": "Gets existing agent config, creates Flow Module, generates correct toolId/toolName, updates agent with new MCP tool",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "My Connect AI agent keeps failing when I try to add a Flow Module as a tool. It says 'MCP tool not found'. What am I doing wrong?",
+      "expected_output": "Identifies toolId format issue, explains aws_custom_flows__UUID_VERSION format, shows correct toolName derivation",
+      "files": []
+    }
+  ]
+}
