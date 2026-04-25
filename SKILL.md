@@ -31,6 +31,54 @@ Caller → Connect Flow → AI Agent (ORCHESTRATION)
 3. boto3 installed
 4. `requests` package installed (for direct API calls - boto3 doesn't support all features)
 
+## CRITICAL: Test Lambda First!
+
+**ALWAYS test the Lambda before creating/updating a module** to understand its input parameters and output schema:
+
+```python
+import boto3
+import json
+
+lambda_client = boto3.client('lambda', region_name=REGION)
+
+# Test with sample parameters
+response = lambda_client.invoke(
+    FunctionName=LAMBDA_ARN,
+    InvocationType='RequestResponse',
+    Payload=json.dumps({
+        'Details': {
+            'Parameters': {
+                'param1': 'test_value',
+                'param2': 'another_value'
+            }
+        }
+    })
+)
+
+result = json.loads(response['Payload'].read())
+print(json.dumps(result, indent=2))
+
+# Expected format:
+# {
+#   "statusCode": 200,
+#   "result": {
+#     "field1": "value1",
+#     "field2": "value2"
+#   }
+# }
+```
+
+From the Lambda response, extract:
+- **Input parameters**: The keys your Lambda expects in `event['Details']['Parameters']`
+- **Output fields**: The keys inside `result` object **ONLY** (NEVER include statusCode!)
+
+**⚠️ CRITICAL: DO NOT include `statusCode` in output schema!**
+- Only map fields from inside `result: {...}`
+- `statusCode` breaks the module - Connect rejects it
+- All output types MUST be `"string"` (even numbers/arrays get stringified)
+
+This determines the `input.schema` and `resultData.schema` for the module.
+
 ## Complete Workflow
 
 The full sequence to create a working MCP tool:
@@ -62,7 +110,17 @@ lambda_client.add_permission(
 
 ### Step 2: Create Flow Module (Direct API Required!)
 
-**IMPORTANT**: boto3's `create_contact_flow_module()` does NOT support `ExternalInvocationConfiguration`. You MUST use a direct API call:
+**IMPORTANT**: boto3's `create_contact_flow_module()` does NOT support `ExternalInvocationConfiguration` or `Settings` schema. You MUST use a direct API call.
+
+#### Key Concepts
+
+- **Input paths**: `$.Modules.Input.<param>` - passes agent parameters to Lambda
+- **Output paths**: `$.External.result.<field>` - maps Lambda response fields to agent
+- **Settings schema**: Defines what inputs/outputs the module accepts (ALL types must be "string"!)
+- **LambdaInvocationAttributes**: Maps input parameters in the flow content
+- **ResultData**: Maps output fields in the EndModule action
+
+#### Create New Module
 
 ```python
 import boto3
@@ -74,7 +132,29 @@ from botocore.awsrequest import AWSRequest
 session = boto3.Session(region_name=REGION)
 credentials = session.get_credentials()
 
-# Flow content - use this exact structure
+# Example: Lambda expects {date, service_type, location} and returns {available_slots, count, ...}
+INPUT_PARAMS = ['date', 'service_type', 'location']  # From Lambda test
+OUTPUT_FIELDS = ['available_slots', 'count', 'date', 'service']  # From Lambda response.result
+
+# Build input schema (ALL types must be "string"!)
+input_schema = {
+    "type": "object",
+    "properties": {p: {"type": "string"} for p in INPUT_PARAMS}
+}
+
+# Build output schema (ALL types must be "string" - Connect limitation!)
+output_schema = {
+    "type": "object", 
+    "properties": {f: {"type": "string"} for f in OUTPUT_FIELDS}
+}
+
+# Build LambdaInvocationAttributes
+lambda_inputs = {p: f"$.Modules.Input.{p}" for p in INPUT_PARAMS}
+
+# Build ResultData
+result_data = {f: f"$.External.result.{f}" for f in OUTPUT_FIELDS}
+
+# Flow content with proper input/output mapping
 content = {
     "Version": "2019-10-30",
     "StartAction": "InvokeLambda",
@@ -85,18 +165,24 @@ content = {
             "InvokeLambda": {
                 "position": {"x": 0, "y": 260},
                 "parameters": {"LambdaFunctionARN": {"displayName": LAMBDA_ARN}},
-                "dynamicMetadata": {}
+                "dynamicMetadata": {p: False for p in INPUT_PARAMS}
             }
         },
         "Annotations": []
     },
     "Actions": [
-        {"Parameters": {}, "Identifier": "EndModule", "Type": "EndFlowModuleExecution", "Transitions": {}},
+        {
+            "Parameters": {"ResultData": result_data},
+            "Identifier": "EndModule",
+            "Type": "EndFlowModuleExecution",
+            "Transitions": {}
+        },
         {
             "Parameters": {
                 "LambdaFunctionARN": LAMBDA_ARN,
                 "InvocationTimeLimitSeconds": "8",
-                "ResponseValidation": {"ResponseType": "JSON"}
+                "ResponseValidation": {"ResponseType": "JSON"},
+                "LambdaInvocationAttributes": lambda_inputs
             },
             "Identifier": "InvokeLambda",
             "Type": "InvokeLambdaFunction",
@@ -116,18 +202,21 @@ content = {
     }
 }
 
+# Settings with schemas (separate from content!)
+settings = {
+    "input": {"schema": input_schema},
+    "resultData": {"schema": output_schema},
+    "transitions": {"results": []}
+}
+
 # Direct API call (PUT to create)
 endpoint = f"https://connect.{REGION}.amazonaws.com/contact-flow-modules/{INSTANCE_ID}"
 
 body = json.dumps({
-    'Name': f'MCP-Tool-{TOOL_NAME}',
+    'Name': TOOL_NAME,  # Use descriptive name like "check-date" not "tool_UUID"
     'Description': TOOL_DESCRIPTION,  # This is what the AI sees!
     'Content': json.dumps(content),
-    'Settings': json.dumps({
-        "input": {"schema": {"type": "object", "properties": {}}},
-        "resultData": {"schema": {"type": "object", "properties": {}}},
-        "transitions": {"results": []}
-    }),
+    'Settings': json.dumps(settings),
     'ExternalInvocationConfiguration': {'Enabled': True}  # CRITICAL!
 })
 
@@ -136,6 +225,25 @@ SigV4Auth(credentials, 'connect', REGION).add_auth(request)
 response = requests.put(endpoint, headers=dict(request.headers), data=body)
 response.raise_for_status()
 MODULE_ID = response.json()['Id']
+```
+
+#### Update Existing Module
+
+To update an existing module's content and schema:
+
+```python
+# UPDATE endpoint (POST, not PUT!)
+endpoint = f"https://connect.{REGION}.amazonaws.com/contact-flow-modules/{INSTANCE_ID}/{MODULE_ID}/content"
+
+body = json.dumps({
+    'Content': json.dumps(content),
+    'Settings': json.dumps(settings)
+})
+
+request = AWSRequest(method='POST', url=endpoint, data=body, headers={'Content-Type': 'application/json'})
+SigV4Auth(credentials, 'connect', REGION).add_auth(request)
+response = requests.post(endpoint, headers=dict(request.headers), data=body)
+response.raise_for_status()
 ```
 
 ### Step 3: Create Version
@@ -156,9 +264,76 @@ VERSION = version_resp['Version']  # int
 # toolId format
 tool_id = f"aws_custom_flows__{MODULE_ID}_{VERSION}"
 
-# toolName MUST start with a letter!
-tool_name = 'tool_' + MODULE_ID.replace('-', '_')
+# toolName - use descriptive name, not just UUID!
+# Must start with a letter, use underscores
+tool_name = TOOL_NAME.lower().replace('-', '_').replace(' ', '_')
+if not tool_name[0].isalpha():
+    tool_name = 'tool_' + tool_name
 ```
+
+### Step 4b: Create ORCHESTRATION Prompt (if creating new agent)
+
+The prompt defines how the AI agent behaves. Create via Console or API:
+
+```python
+# ORCHESTRATION prompt template
+PROMPT_TEMPLATE = """You are a helpful customer service agent for {{company_name}}.
+
+## Your Role
+- Assist customers with their inquiries professionally and efficiently
+- Use available tools to look up information and perform actions
+- Always confirm actions before executing them
+- Be concise but thorough in your responses
+
+## Available Tools
+You have access to the following tools. Use them when appropriate:
+
+{{#each tools}}
+### {{toolName}}
+{{description}}
+{{/each}}
+
+## Guidelines
+1. **Greet** the customer warmly
+2. **Listen** to understand their needs
+3. **Use tools** to gather information or perform actions
+4. **Confirm** before making changes
+5. **Summarize** what was done
+6. **Ask** if there's anything else
+
+## Important Rules
+- Never share sensitive internal information
+- If unsure, escalate to a human agent using the Escalate tool
+- Always verify customer identity before account changes
+- Use Complete tool when the customer is satisfied
+
+## Response Format
+- Keep responses conversational and natural
+- Use bullet points for lists
+- Confirm understanding before taking action
+"""
+
+# Create prompt via API
+prompt_response = qconnect.create_ai_prompt(
+    assistantId=ASSISTANT_ID,
+    name=f'{AGENT_NAME}-prompt',
+    description='ORCHESTRATION prompt for customer service agent',
+    type='ORCHESTRATION',
+    templateType='TEXT',
+    templateConfiguration={
+        'textFullAIPromptEditTemplateConfiguration': {
+            'text': PROMPT_TEMPLATE
+        }
+    },
+    visibilityStatus='PUBLISHED'
+)
+PROMPT_ID = f"{prompt_response['aiPrompt']['aiPromptId']}:$LATEST"
+```
+
+**Prompt Variables (Handlebars syntax):**
+- `{{company_name}}` - Your company name
+- `{{#each tools}}...{{/each}}` - Iterates over attached tools
+- `{{toolName}}`, `{{description}}` - Tool properties
 
 ### Step 5: Attach Tool to Agent
 
@@ -274,18 +449,33 @@ Output: refund_status, refund_amount, expected_date
 ```
 
 ### Lambda Response Format
-Your Lambda should return JSON that the AI can interpret:
+
+Your Lambda MUST return this exact structure for the module to work:
 
 ```python
 def lambda_handler(event, context):
-    # Parameters come directly in event
-    param1 = event.get('param1')
+    # Parameters come from event['Details']['Parameters'] when invoked via Connect
+    params = event.get('Details', {}).get('Parameters', {})
+    # Or directly from event for testing
+    param1 = params.get('param1') or event.get('param1')
     
+    # DO NOT return statusCode in the result that modules map!
+    # The module maps fields from INSIDE 'result' only
     return {
-        'statusCode': 200,
-        'result': 'your result here'
+        'statusCode': 200,  # This is for Lambda, NOT mapped by module
+        'result': {         # Module ResultData maps from HERE
+            'field1': 'value1',
+            'field2': 'value2',
+            'count': str(some_number),  # Convert to string!
+            'items': json.dumps(some_list)  # Stringify arrays!
+        }
     }
 ```
+
+**⚠️ Module output mapping:**
+- ResultData uses `$.External.result.<field>` - it reads from INSIDE `result`
+- NEVER include `statusCode` in your output schema
+- ALL values should be strings (Connect limitation)
 
 ## Common Errors
 
@@ -295,8 +485,11 @@ def lambda_handler(event, context):
 | `Tool name invalid characters` | toolName starts with number | Prefix with `tool_` |
 | `Insufficient permissions` in Console | Security profile not attached or module not allowed | Run steps 6 & 7 |
 | `does not allow overriding description` | Adding description to MCP tool config | Only use toolName, toolType, toolId |
-| `InvalidContactFlowModuleException` | Wrong flow content structure | Use exact format in Step 2 (StartAction: action name, EndFlowModuleExecution type) |
+| `InvalidContactFlowModuleException` | Wrong flow content structure or statusCode in output | Use exact format in Step 2, remove statusCode from output schema |
+| `InvalidContactFlowModuleException` on update | Settings schema not set or wrong type | Use direct API with Settings, all types must be "string" |
 | `Missing required parameter: AliasName` | Using `Name` instead of `AliasName` for alias | Use `AliasName` param and `ContactFlowModuleVersion` as int |
+| Agent says "having trouble" | Module output not configured | Add ResultData to EndModule with `$.External.result.<field>` paths |
+| Empty parameters in Lambda | Wrong input path format | Use `$.Modules.Input.<param>` NOT `$.Modules.<param>` |
 
 ## Optional: Create Alias
 
