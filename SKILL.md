@@ -134,18 +134,22 @@ credentials = session.get_credentials()
 
 # Example: Lambda expects {date, service_type, location} and returns {available_slots, count, ...}
 INPUT_PARAMS = ['date', 'service_type', 'location']  # From Lambda test
-OUTPUT_FIELDS = ['available_slots', 'count', 'date', 'service']  # From Lambda response.result
+REQUIRED_PARAMS = ['date', 'service_type', 'location']  # Which params AI MUST pass
+OUTPUT_FIELDS = ['available_slots', 'count', 'date', 'service']  # From Lambda response.result (MAX 10!)
 
 # Build input schema (ALL types must be "string"!)
+# CRITICAL: Include "required" array or AI may not pass parameters!
 input_schema = {
     "type": "object",
-    "properties": {p: {"type": "string"} for p in INPUT_PARAMS}
+    "properties": {p: {"type": "string"} for p in INPUT_PARAMS},
+    "required": REQUIRED_PARAMS  # <-- CRITICAL! Without this, AI might skip params
 }
 
 # Build output schema (ALL types must be "string" - Connect limitation!)
+# ⚠️ MAX 10 OUTPUT FIELDS! Connect rejects more than 10.
 output_schema = {
     "type": "object", 
-    "properties": {f: {"type": "string"} for f in OUTPUT_FIELDS}
+    "properties": {f: {"type": "string"} for f in OUTPUT_FIELDS}  # Max 10 fields!
 }
 
 # Build LambdaInvocationAttributes
@@ -248,6 +252,8 @@ response.raise_for_status()
 
 ### Step 3: Create Version
 
+After updating a module, you MUST create a new version for changes to take effect:
+
 ```python
 connect = boto3.client('connect', region_name=REGION)
 
@@ -258,14 +264,18 @@ version_resp = connect.create_contact_flow_module_version(
 VERSION = version_resp['Version']  # int
 ```
 
+**NOTE: Agent auto-updates!** Once you publish a new module version, the agent automatically uses it. You do NOT need to re-attach tools or update the agent - just create a new version.
+
 ### Step 4: Build Tool Identifiers
 
 ```python
 # toolId format
 tool_id = f"aws_custom_flows__{MODULE_ID}_{VERSION}"
 
-# toolName - use descriptive name, not just UUID!
+# toolName - use descriptive name from flow module, NOT UUID!
 # Must start with a letter, use underscores
+# Good: "check_availability", "book_appointment"
+# Bad: "tool_8537782e_2ceb_4ac0"
 tool_name = TOOL_NAME.lower().replace('-', '_').replace(' ', '_')
 if not tool_name[0].isalpha():
     tool_name = 'tool_' + tool_name
@@ -476,6 +486,35 @@ def lambda_handler(event, context):
 - ResultData uses `$.External.result.<field>` - it reads from INSIDE `result`
 - NEVER include `statusCode` in your output schema
 - ALL values should be strings (Connect limitation)
+- **MAX 10 output fields** - Connect rejects schemas with more than 10
+
+## Verification Checklist
+
+Before testing, verify BOTH the Settings schema AND the Content blocks match:
+
+```python
+# Verify module is correctly configured
+connect = boto3.client('connect', region_name=REGION)
+resp = connect.describe_contact_flow_module(InstanceId=INSTANCE_ID, ContactFlowModuleId=MODULE_ID)
+content = json.loads(resp['ContactFlowModule']['Content'])
+
+# Check Content blocks
+for action in content['Actions']:
+    if action['Identifier'] == 'InvokeLambda':
+        block_inputs = list(action['Parameters'].get('LambdaInvocationAttributes', {}).keys())
+        print(f"Content Block Inputs: {block_inputs}")
+    if action['Identifier'] == 'EndModule':
+        block_outputs = list(action['Parameters'].get('ResultData', {}).keys())
+        print(f"Content Block Outputs: {block_outputs}")
+
+# Check Settings schema (via direct API)
+# Settings input.schema.properties should match LambdaInvocationAttributes keys
+# Settings resultData.schema.properties should match ResultData keys
+```
+
+**CRITICAL: Content blocks and Settings schema MUST match exactly!**
+- `LambdaInvocationAttributes` keys = `input.schema.properties` keys
+- `ResultData` keys = `resultData.schema.properties` keys
 
 ## Common Errors
 
@@ -485,11 +524,15 @@ def lambda_handler(event, context):
 | `Tool name invalid characters` | toolName starts with number | Prefix with `tool_` |
 | `Insufficient permissions` in Console | Security profile not attached or module not allowed | Run steps 6 & 7 |
 | `does not allow overriding description` | Adding description to MCP tool config | Only use toolName, toolType, toolId |
+| `does not allow overriding input schema` | Trying to add inputSchema to MCP tool | Remove inputSchema - it comes from module Settings |
 | `InvalidContactFlowModuleException` | Wrong flow content structure or statusCode in output | Use exact format in Step 2, remove statusCode from output schema |
+| `Invalid ResultData schema` | More than 10 output fields | Reduce to max 10 fields |
 | `InvalidContactFlowModuleException` on update | Settings schema not set or wrong type | Use direct API with Settings, all types must be "string" |
 | `Missing required parameter: AliasName` | Using `Name` instead of `AliasName` for alias | Use `AliasName` param and `ContactFlowModuleVersion` as int |
 | Agent says "having trouble" | Module output not configured | Add ResultData to EndModule with `$.External.result.<field>` paths |
 | Empty parameters in Lambda | Wrong input path format | Use `$.Modules.Input.<param>` NOT `$.Modules.<param>` |
+| AI doesn't pass required params | Missing `required` array in input schema | Add `"required": [...]` to input schema |
+| AI passes empty strings | Param not in required array | Add param to `"required"` array |
 
 ## Optional: Create Alias
 
